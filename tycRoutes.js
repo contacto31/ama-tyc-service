@@ -2,6 +2,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
+const { pool } = require('./db');
 const { requireInternalSecret } = require('./internalAuth');
 
 const router = express.Router();
@@ -93,70 +94,112 @@ async function sendWebhook(solicitud, evento) {
  *  - token
  *  - expiresAt
  */
-router.post('/api/tyc/solicitudes', requireInternalSecret, (req, res) => {
-  const { preclienteId, canal, ttlMinutos, webhookUrl, metadata } = req.body || {};
+router.post('/api/tyc/solicitudes', async (req, res) => {
+  try {
+    const { preclienteId, canal, ttlMinutos, webhookUrl, metadata } = req.body || {};
 
-  // Validaciones básicas
-  if (!preclienteId) {
-    return res.status(400).json({
+    // Validaciones básicas
+    if (!preclienteId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'preclienteId es obligatorio'
+      });
+    }
+
+    if (!webhookUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: 'webhookUrl es obligatorio (a dónde avisaremos a n8n)'
+      });
+    }
+
+    // TTL (tiempo de vida) en minutos; default 60
+    const ttl = typeof ttlMinutos === 'number' && ttlMinutos > 0 ? ttlMinutos : 60;
+
+    const ahora = new Date();
+    const expiresAt = new Date(ahora.getTime() + ttl * 60 * 1000);
+
+    // Generamos un token aleatorio seguro
+    const token = crypto.randomBytes(16).toString('hex');
+
+    // Generamos un ID de solicitud (simple por ahora)
+    const tycSolicitudId = `TYC-${Date.now()}`;
+
+    // Creamos el objeto de solicitud (lo que vamos a guardar en memoria y usar para responder)
+    const solicitud = {
+      tycSolicitudId,
+      preclienteId,
+      canal: canal || 'WHATSAPP',
+      token,
+      estado: STATES.CREADA,
+      createdAt: ahora.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      webhookUrl,
+      metadata: metadata || {},
+      acceptedAt: null,
+      acceptedIp: null,
+      acceptedUserAgent: null
+    };
+
+    // Guardar en BD (tabla tyc_solicitudes)
+    try {
+      await pool.query(
+        `INSERT INTO tyc_solicitudes (
+          tyc_solicitud_id,
+          precliente_id,
+          token,
+          canal,
+          webhook_url,
+          metadata,
+          estado,
+          created_at,
+          expires_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          solicitud.tycSolicitudId,
+          solicitud.preclienteId,
+          solicitud.token,
+          solicitud.canal,
+          solicitud.webhookUrl,
+          solicitud.metadata,
+          solicitud.estado,
+          solicitud.createdAt,
+          solicitud.expiresAt
+        ]
+      );
+    } catch (err) {
+      console.error('[TyC] Error guardando solicitud en BD:', err);
+      return res.status(500).json({
+        ok: false,
+        error: 'Error guardando la solicitud de TyC en la base de datos'
+      });
+    }
+
+    // Guardamos en la "mini-DB" en memoria (para compatibilidad con lo que ya está hecho)
+    solicitudesTyC.set(token, solicitud);
+
+    // Construimos la URL base desde ENV o default en local
+    const baseUrl = process.env.TYC_BASE_URL || `http://localhost:${process.env.PORT || 3002}`;
+    const url = `${baseUrl}/tyc/${token}`;
+
+    // Respondemos a n8n
+    return res.json({
+      ok: true,
+      tycSolicitudId,
+      preclienteId,
+      url,
+      token,
+      expiresAt: solicitud.expiresAt
+    });
+  } catch (err) {
+    console.error('[TyC] Error inesperado en /api/tyc/solicitudes:', err);
+    return res.status(500).json({
       ok: false,
-      error: 'preclienteId es obligatorio'
+      error: 'Error inesperado creando la solicitud de TyC'
     });
   }
-
-  if (!webhookUrl) {
-    return res.status(400).json({
-      ok: false,
-      error: 'webhookUrl es obligatorio (a dónde avisaremos a n8n)'
-    });
-  }
-
-  // TTL (tiempo de vida) en minutos; default 60
-  const ttl = typeof ttlMinutos === 'number' && ttlMinutos > 0 ? ttlMinutos : 60;
-
-  const ahora = new Date();
-  const expiresAt = new Date(ahora.getTime() + ttl * 60 * 1000);
-
-  // Generamos un token aleatorio seguro
-  const token = crypto.randomBytes(16).toString('hex');
-
-  // Generamos un ID de solicitud (simple por ahora)
-  const tycSolicitudId = `TYC-${Date.now()}`;
-
-  // Creamos el objeto de solicitud
-  const solicitud = {
-    tycSolicitudId,
-    preclienteId,
-    canal: canal || 'WHATSAPP',
-    token,
-    estado: STATES.CREADA,
-    createdAt: ahora.toISOString(),
-    expiresAt: expiresAt.toISOString(),
-    webhookUrl,
-    metadata: metadata || {},
-    openedAt: null,
-    acceptedAt: null,
-    acceptedIp: null,
-    acceptedUserAgent: null
-  };
-
-  // Guardamos en la "mini-DB" en memoria
-  solicitudesTyC.set(token, solicitud);
-
-  // Construimos la URL base desde ENV o default en local
-  const baseUrl = process.env.TYC_BASE_URL || `http://localhost:${process.env.PORT || 3002}`;
-  const url = `${baseUrl}/tyc/${token}`;
-
-  // Respondemos a n8n
-  return res.json({
-    ok: true,
-    tycSolicitudId,
-    preclienteId,
-    url,
-    token,
-    expiresAt: solicitud.expiresAt
-  });
 });
+
 
 /**
  * GET /tyc/:token
