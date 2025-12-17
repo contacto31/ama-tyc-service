@@ -121,6 +121,9 @@ router.post('/api/tyc/solicitudes', async (req, res) => {
 
     // Generamos un token aleatorio seguro
     const token = crypto.randomBytes(16).toString('hex');
+    
+    // Hash del token para guardar en BD (token_hash)
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
 
     // Generamos un ID de solicitud (simple por ahora)
     const tycSolicitudId = `TYC-${Date.now()}`;
