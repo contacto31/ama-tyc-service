@@ -147,29 +147,31 @@ router.post('/api/tyc/solicitudes', async (req, res) => {
     // Guardar en BD (tabla tyc_solicitudes)
     try {
       await pool.query(
-        `INSERT INTO tyc_solicitudes (
-          tyc_solicitud_id,
-          precliente_id,
-          token,
-          canal,
-          webhook_url,
-          metadata,
-          estado,
-          created_at,
-          expires_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [
-          solicitud.tycSolicitudId,
-          solicitud.preclienteId,
-          solicitud.token,
-          solicitud.canal,
-          solicitud.webhookUrl,
-          solicitud.metadata,
-          solicitud.estado,
-          solicitud.createdAt,
-          solicitud.expiresAt
-        ]
-      );
+  `INSERT INTO tyc_solicitudes (
+    tyc_solicitud_id,
+    precliente_id,
+    token,
+    token_hash,
+    canal,
+    webhook_url,
+    metadata,
+    estado,
+    created_at,
+    expires_at
+  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+  [
+    solicitud.tycSolicitudId,
+    solicitud.preclienteId,
+    solicitud.token,
+    tokenHash,
+    solicitud.canal,
+    solicitud.webhookUrl,
+    solicitud.metadata,
+    solicitud.estado,
+    solicitud.createdAt,
+    solicitud.expiresAt
+  ]
+);
     } catch (err) {
       console.error('[TyC] Error guardando solicitud en BD:', err);
       return res.status(500).json({
