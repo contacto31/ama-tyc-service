@@ -219,15 +219,65 @@ router.post('/api/tyc/solicitudes', async (req, res) => {
  *    - Caja scrollable con el texto del contrato
  *    - Botón de "Aceptar" que se habilita solo al llegar al final del texto
  */
-router.get('/tyc/:token', (req, res) => {
+router.get('/tyc/:token', async (req, res) => {
   const { token } = req.params;
 
-  const solicitud = solicitudesTyC.get(token);
+  // 1) Intentamos primero en memoria
+  let solicitud = solicitudesTyC.get(token);
 
+  // 2) Si no está en memoria (reinicio / scale), la traemos de BD
   if (!solicitud) {
-    return res
-      .status(404)
-      .send('<h1>Enlace inválido</h1><p>Esta URL no existe o ya no es válida.</p>');
+    try {
+      const r = await pool.query(
+        `SELECT
+          tyc_solicitud_id,
+          precliente_id,
+          token,
+          canal,
+          webhook_url,
+          metadata,
+          estado,
+          created_at,
+          expires_at,
+          opened_at,
+          accepted_at,
+          accepted_ip
+        FROM tyc_solicitudes
+        WHERE token = $1
+        LIMIT 1`,
+        [token]
+      );
+
+      if (r.rowCount === 0) {
+        return res
+          .status(404)
+          .send('<h1>Enlace inválido</h1><p>Esta URL no existe o ya no es válida.</p>');
+      }
+
+      const row = r.rows[0];
+
+      // Re-hidratamos al mismo formato que usas en memoria
+      solicitud = {
+        tycSolicitudId: row.tyc_solicitud_id,
+        preclienteId: row.precliente_id,
+        canal: row.canal,
+        token: row.token,
+        estado: row.estado,
+        createdAt: row.created_at?.toISOString?.() ?? String(row.created_at),
+        expiresAt: row.expires_at?.toISOString?.() ?? String(row.expires_at),
+        webhookUrl: row.webhook_url,
+        metadata: row.metadata || {},
+        openedAt: row.opened_at ? (row.opened_at.toISOString?.() ?? String(row.opened_at)) : null,
+        acceptedAt: row.accepted_at ? (row.accepted_at.toISOString?.() ?? String(row.accepted_at)) : null,
+        acceptedIp: row.accepted_ip || null,
+      };
+
+      // Guardamos en memoria para que lo demás siga igual
+      solicitudesTyC.set(token, solicitud);
+    } catch (err) {
+      console.error('[TyC] Error consultando BD en GET /tyc/:token:', err);
+      return res.status(500).send('<h1>Error</h1><p>Error interno.</p>');
+    }
   }
 
   const ahora = new Date();
@@ -235,29 +285,69 @@ router.get('/tyc/:token', (req, res) => {
 
   // Verificar expiración
   if (expira < ahora && solicitud.estado !== STATES.ACEPTADA) {
-    solicitud.estado = STATES.EXPIRADA;
-    solicitudesTyC.set(token, solicitud);
+    const yaEstabaExpirada = (solicitud.estado === STATES.EXPIRADA);
 
-    // Avisamos a n8n que esta solicitud expiró
-    sendWebhook(solicitud, 'TYC_EXPIRADA').catch((err) => {
-      console.error('Error en webhook TYC_EXPIRADA (GET /tyc):', err.message);
-    });
+    // Solo si NO estaba expirada, cambiamos estado y avisamos a n8n
+    if (!yaEstabaExpirada) {
+      solicitud.estado = STATES.EXPIRADA;
+      solicitudesTyC.set(token, solicitud);
+
+      // Persistimos estado EXPIRADA en BD
+      try {
+        await pool.query(
+          `UPDATE tyc_solicitudes
+           SET estado = $2
+           WHERE token = $1`,
+          [token, STATES.EXPIRADA]
+        );
+      } catch (err) {
+        console.error('[TyC] Error actualizando estado EXPIRADA en BD:', err);
+      }
+
+      // Avisamos a n8n que esta solicitud expiró
+      sendWebhook(solicitud, 'TYC_EXPIRADA').catch((err) => {
+        console.error('Error en webhook TYC_EXPIRADA (GET /tyc):', err.message);
+      });
+    }
 
     return res
       .status(410)
       .send('<h1>Enlace expirado</h1><p>Esta URL ya no está disponible. Solicita una nueva.</p>');
   }
 
-  // Si estaba CREADA, la marcamos como ABIERTA y registramos openedAt
+  // Si estaba CREADA, la marcamos como ABIERTA y registramos openedAt (memoria)
   if (solicitud.estado === STATES.CREADA) {
     solicitud.estado = STATES.ABIERTA;
     solicitud.openedAt = nowIso();
     solicitudesTyC.set(token, solicitud);
   }
 
+  // Persistimos opened_at (solo si es null) y el cambio de estado a ABIERTA (solo si era CREADA)
+  try {
+    await pool.query(
+      `UPDATE tyc_solicitudes
+       SET
+         opened_at = COALESCE(opened_at, NOW()),
+         estado = CASE WHEN estado = $2 THEN $3 ELSE estado END
+       WHERE token = $1`,
+      [token, STATES.CREADA, STATES.ABIERTA]
+    );
+  } catch (err) {
+    console.error('[TyC] Error actualizando opened_at/estado en BD:', err);
+  }
+
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
 
-  const fechaExpiraStr = expira.toLocaleString('es-MX');
+  const fechaExpiraStr = new Intl.DateTimeFormat('es-MX', {
+    timeZone: 'America/Mexico_City',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true
+  }).format(expira);
 
   const html = `
 <!DOCTYPE html>
@@ -325,6 +415,31 @@ router.get('/tyc/:token', (req, res) => {
       background-color: #E27C39;
       color: #fff;
     }
+
+    .btn-secondary {
+      background-color: #3C3C3C;
+      color: #fff;
+    }
+    .btn-accepted {
+      background-color: #16a34a !important;
+      color: #fff !important;
+      cursor: not-allowed !important;
+      opacity: 0.98;
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .actions .btn-secondary {
+      width: 50%;
+      padding: 10px 12px;
+      font-size: 14px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
     .footer-text {
       font-size: 11px;
       color: #999;
@@ -369,27 +484,33 @@ router.get('/tyc/:token', (req, res) => {
       <p><strong>5. Tratamiento de datos personales</strong><br/>
       Los datos del contratante, del vehículo y de geolocalización se utilizarán exclusivamente para la prestación del servicio y para el cumplimiento de obligaciones legales. El detalle del aviso de privacidad forma parte integral de estos términos.</p>
 
-      <p>Al aceptar estos términos y condiciones, reconoces que has leído y comprendido el contenido del contrato, y aceptas de manera voluntaria las obligaciones y alcances del servicio AMA Track & Safe.</p>
-
-      <p><em>(Este texto es un borrador. Posteriormente lo reemplazaremos por el contrato legal final.)</em></p>
-    </div>
-
-    <button id="btnAceptar" class="btn-primary" disabled>Acepto términos y condiciones</button>
-
-    <div id="msg" class="msg"></div>
-
-    <div class="footer-text">
-      AMA Track & Safe &copy; ${new Date().getFullYear()}
-    </div>
-
-    <script>
-      // El backend inyecta aquí el token actual
+      <p>Al aceptar estos términos y condiciones, reconoces que has leí// El backend inyecta aquí el token actual
       const TOKEN = "${token}";
+      const ALREADY_ACCEPTED = ${solicitud.estado === STATES.ACEPTADA ? 'true' : 'false'};
       const tycBox = document.getElementById('tycBox');
       const btnAceptar = document.getElementById('btnAceptar');
+      const btnDescargar = document.getElementById('btnDescargar');
+      const btnImprimir = document.getElementById('btnImprimir');
       const msg = document.getElementById('msg');
 
+      let tycAceptados = false;
+
+      function marcarComoAceptadoUI() {
+        tycAceptados = true;
+        if (!btnAceptar) return;
+
+        btnAceptar.disabled = true;
+        btnAceptar.textContent = 'Términos y condiciones aceptados';
+        btnAceptar.classList.add('btn-accepted');
+        msg.textContent = '✅ Términos y condiciones aceptados. Puedes regresar a la conversación.';
+      }
+
       function checkScroll() {
+        if (tycAceptados) {
+          btnAceptar.disabled = true;
+          return;
+        }
+
         const scrollTop = tycBox.scrollTop;
         const scrollHeight = tycBox.scrollHeight;
         const clientHeight = tycBox.clientHeight;
@@ -397,18 +518,75 @@ router.get('/tyc/:token', (req, res) => {
         if (scrollTop + clientHeight >= scrollHeight - 5) {
           btnAceptar.disabled = false;
           msg.textContent = "Ya puedes aceptar los términos y condiciones.";
+        } else {
+          btnAceptar.disabled = true;
+          msg.textContent = "Desplázate hasta el final para habilitar el botón.";
         }
       }
 
-      tycBox.addEventListener('scroll', checkScroll);
+      // Inicializa estado al cargar
+      if (ALREADY_ACCEPTED) {
+        marcarComoAceptadoUI();
+      } else {
+        msg.textContent = "Desplázate hasta el final para habilitar el botón.";
+        tycBox.addEventListener('scroll', checkScroll);
+        checkScroll();
+      }
 
       btnAceptar.addEventListener('click', async () => {
+        if (tycAceptados) return;
+
         btnAceptar.disabled = true;
         msg.textContent = "Registrando tu aceptación, por favor espera...";
 
         try {
           const response = await fetch("/api/tyc/" + encodeURIComponent(TOKEN) + "/aceptar", {
             method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({})
+          });
+
+          const data = await response.json();
+
+          if (!data.ok) {
+            msg.textContent = "No fue posible registrar tu aceptación: " + (data.error || "intenta más tarde.");
+            // Permitimos reintentar, pero solo se habilitará si está al final.
+            tycAceptados = false;
+            checkScroll();
+            return;
+          }
+
+          marcarComoAceptadoUI();
+        } catch (error) {
+          console.error(error);
+          msg.textContent = "Ocurrió un error al registrar tu aceptación. Intenta nuevamente.";
+          tycAceptados = false;
+          checkScroll();
+        }
+      });
+
+      // Descargar como TXT (simple, sin PDF)
+      btnDescargar?.addEventListener('click', () => {
+        const contenido = tycBox?.innerText || '';
+        const blob = new Blob([contenido], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'terminos-y-condiciones-ama-track-safe.txt';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+
+        URL.revokeObjectURL(url);
+      });
+
+      // Imprimir
+      btnImprimir?.addEventListener('click', () => {
+        window.print();
+      });ST",
             headers: {
               "Content-Type": "application/json"
             },
@@ -448,74 +626,166 @@ router.get('/tyc/:token', (req, res) => {
  * - Marca la solicitud como ACEPTADA.
  * - Guarda fecha, IP y user-agent.
  */
-router.post('/api/tyc/:token/aceptar', (req, res) => {
+router.post('/api/tyc/:token/aceptar', async (req, res) => {
   const { token } = req.params;
 
-  const solicitud = solicitudesTyC.get(token);
+  const getClientIp = (req) => {
+    const xf = req.headers['x-forwarded-for'];
+    let ip = Array.isArray(xf) ? xf[0] : (xf ? String(xf).split(',')[0].trim() : null);
+    ip = ip || req.ip || req.socket?.remoteAddress || null;
+    if (ip && ip.startsWith('::ffff:')) ip = ip.replace('::ffff:', '');
+    return ip;
+  };
 
-  if (!solicitud) {
-    return res.status(404).json({
-      ok: false,
-      error: 'Solicitud no encontrada'
-    });
-  }
+  try {
+    // 1) Intentar memoria primero
+    let solicitud = solicitudesTyC.get(token);
 
-  const ahora = new Date();
-  const expira = new Date(solicitud.expiresAt);
+    // 2) Si no está en memoria, cargar desde BD
+    if (!solicitud) {
+      const r = await pool.query(
+        `SELECT
+          tyc_solicitud_id,
+          precliente_id,
+          token,
+          canal,
+          webhook_url,
+          metadata,
+          estado,
+          created_at,
+          expires_at,
+          opened_at,
+          accepted_at,
+          accepted_ip
+        FROM tyc_solicitudes
+        WHERE token = $1
+        LIMIT 1`,
+        [token]
+      );
 
-  // Si ya expiró y no estaba aceptada, la marcamos como EXPIRADA
-  if (expira < ahora && solicitud.estado !== STATES.ACEPTADA) {
-    solicitud.estado = STATES.EXPIRADA;
+      if (r.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: 'Solicitud no encontrada' });
+      }
+
+      const row = r.rows[0];
+
+      solicitud = {
+        tycSolicitudId: row.tyc_solicitud_id,
+        preclienteId: row.precliente_id,
+        canal: row.canal,
+        token: row.token,
+        estado: row.estado,
+        createdAt: row.created_at?.toISOString?.() ?? String(row.created_at),
+        expiresAt: row.expires_at?.toISOString?.() ?? String(row.expires_at),
+        webhookUrl: row.webhook_url,
+        metadata: row.metadata || {},
+        openedAt: row.opened_at ? (row.opened_at.toISOString?.() ?? String(row.opened_at)) : null,
+        acceptedAt: row.accepted_at ? (row.accepted_at.toISOString?.() ?? String(row.accepted_at)) : null,
+        acceptedIp: row.accepted_ip || null,
+        acceptedUserAgent: null, // en BD no lo guardamos (por ahora)
+      };
+
+      solicitudesTyC.set(token, solicitud);
+    }
+
+    const ahora = new Date();
+    const expira = new Date(solicitud.expiresAt);
+
+    // 3) Si ya expiró y no estaba aceptada, la marcamos EXPIRADA (BD + memoria)
+    if (expira < ahora && solicitud.estado !== STATES.ACEPTADA) {
+      const yaEstabaExpirada = solicitud.estado === STATES.EXPIRADA;
+
+      if (!yaEstabaExpirada) {
+        solicitud.estado = STATES.EXPIRADA;
+        solicitudesTyC.set(token, solicitud);
+
+        // Persistimos EXPIRADA en BD
+        try {
+          await pool.query(
+            `UPDATE tyc_solicitudes
+             SET estado = $2
+             WHERE token = $1`,
+            [token, STATES.EXPIRADA]
+          );
+        } catch (err) {
+          console.error('[TyC] Error actualizando EXPIRADA en BD (POST /aceptar):', err);
+        }
+
+        // Avisamos a n8n que esta solicitud expiró (una vez)
+        sendWebhook(solicitud, 'TYC_EXPIRADA').catch((err) => {
+          console.error('Error en webhook TYC_EXPIRADA (POST /aceptar):', err.message);
+        });
+      }
+
+      return res.status(410).json({
+        ok: false,
+        error: 'La URL ya expiró. Solicita una nueva.'
+      });
+    }
+
+    // 4) Si ya estaba aceptada antes, respondemos ok
+    if (solicitud.estado === STATES.ACEPTADA || solicitud.acceptedAt) {
+      return res.json({
+        ok: true,
+        mensaje: 'Esta solicitud ya había sido aceptada previamente.',
+        preclienteId: solicitud.preclienteId,
+        tycSolicitudId: solicitud.tycSolicitudId,
+        acceptedAt: solicitud.acceptedAt
+      });
+    }
+
+    // 5) Persistir aceptación en BD (idempotente)
+    const ip = getClientIp(req);
+    const ua = req.headers['user-agent'] || null;
+
+    const upd = await pool.query(
+      `UPDATE tyc_solicitudes
+       SET accepted_at = NOW(),
+           accepted_ip = $2,
+           estado = $3
+       WHERE token = $1
+         AND accepted_at IS NULL
+       RETURNING accepted_at`,
+      [token, ip, STATES.ACEPTADA]
+    );
+
+    const acceptedAtIso =
+      upd.rowCount > 0
+        ? (upd.rows[0].accepted_at?.toISOString?.() ?? String(upd.rows[0].accepted_at))
+        : nowIso();
+
+    // 6) Actualizar memoria
+    solicitud.estado = STATES.ACEPTADA;
+    solicitud.acceptedAt = acceptedAtIso;
+    solicitud.acceptedIp = ip;
+    solicitud.acceptedUserAgent = ua;
     solicitudesTyC.set(token, solicitud);
 
-    // Avisamos a n8n que esta solicitud expiró
-    sendWebhook(solicitud, 'TYC_EXPIRADA').catch((err) => {
-      console.error('Error en webhook TYC_EXPIRADA (POST /aceptar):', err.message);
+    // Log en consola
+    console.log('✅ Solicitud TyC aceptada:', {
+      preclienteId: solicitud.preclienteId,
+      tycSolicitudId: solicitud.tycSolicitudId,
+      acceptedAt: solicitud.acceptedAt,
+      acceptedIp: solicitud.acceptedIp
     });
 
-    return res.status(410).json({
-      ok: false,
-      error: 'La URL ya expiró. Solicita una nueva.'
+    // 7) Enviar webhook a n8n
+    sendWebhook(solicitud, 'TYC_ACEPTADA').catch((err) => {
+      console.error('Error en webhook TYC_ACEPTADA:', err.message);
     });
-  }
 
-  // Si ya estaba aceptada antes, respondemos ok pero avisamos
-  if (solicitud.estado === STATES.ACEPTADA) {
     return res.json({
       ok: true,
-      mensaje: 'Esta solicitud ya había sido aceptada previamente.',
+      mensaje: 'Aceptación registrada',
       preclienteId: solicitud.preclienteId,
-      tycSolicitudId: solicitud.tycSolicitudId
+      tycSolicitudId: solicitud.tycSolicitudId,
+      acceptedAt: solicitud.acceptedAt,
+      acceptedIp: solicitud.acceptedIp
     });
+  } catch (err) {
+    console.error('[TyC] Error en POST /api/tyc/:token/aceptar:', err);
+    return res.status(500).json({ ok: false, error: 'Error interno' });
   }
-
-  // Marcamos como ACEPTADA
-  solicitud.estado = STATES.ACEPTADA;
-  solicitud.acceptedAt = nowIso();
-  solicitud.acceptedIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || null;
-  solicitud.acceptedUserAgent = req.headers['user-agent'] || null;
-
-  solicitudesTyC.set(token, solicitud);
-
-  // Log en consola
-  console.log('✅ Solicitud TyC aceptada:', {
-    preclienteId: solicitud.preclienteId,
-    tycSolicitudId: solicitud.tycSolicitudId,
-    acceptedAt: solicitud.acceptedAt,
-    acceptedIp: solicitud.acceptedIp
-  });
-
-  // Enviar webhook a n8n
-  sendWebhook(solicitud, 'TYC_ACEPTADA').catch((err) => {
-    console.error('Error en webhook TYC_ACEPTADA:', err.message);
-  });
-
-  return res.json({
-    ok: true,
-    mensaje: 'Aceptación registrada',
-    preclienteId: solicitud.preclienteId,
-    tycSolicitudId: solicitud.tycSolicitudId
-  });
 });
 
 /**
