@@ -430,6 +430,7 @@ router.get('/tyc/:token', async (req, res) => {
       display: flex;
       gap: 10px;
       margin-top: 10px;
+      margin-bottom: 14px;
     }
     .actions .btn-secondary {
       width: 50%;
