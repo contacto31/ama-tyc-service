@@ -484,9 +484,23 @@ router.get('/tyc/:token', async (req, res) => {
       <p><strong>5. Tratamiento de datos personales</strong><br/>
       Los datos del contratante, del vehículo y de geolocalización se utilizarán exclusivamente para la prestación del servicio y para el cumplimiento de obligaciones legales. El detalle del aviso de privacidad forma parte integral de estos términos.</p>
 
-      <p>Al aceptar estos términos y condiciones, reconoces que has leí// El backend inyecta aquí el token actual
+            <p>Al aceptar estos términos y condiciones, reconoces que has leído, entendido y aceptado el contenido.</p>
+    </div>
+
+    <div id="msg" class="msg"></div>
+
+    <div class="actions">
+      <button id="btnDescargar" class="btn-secondary" type="button">Descargar TyC</button>
+      <button id="btnImprimir" class="btn-secondary" type="button">Imprimir</button>
+    </div>
+
+    <button id="btnAceptar" class="btn-primary" type="button" disabled>Acepto términos y condiciones</button>
+
+    <script>
+      // El backend inyecta aquí el token actual
       const TOKEN = "${token}";
       const ALREADY_ACCEPTED = ${solicitud.estado === STATES.ACEPTADA ? 'true' : 'false'};
+
       const tycBox = document.getElementById('tycBox');
       const btnAceptar = document.getElementById('btnAceptar');
       const btnDescargar = document.getElementById('btnDescargar');
@@ -497,8 +511,6 @@ router.get('/tyc/:token', async (req, res) => {
 
       function marcarComoAceptadoUI() {
         tycAceptados = true;
-        if (!btnAceptar) return;
-
         btnAceptar.disabled = true;
         btnAceptar.textContent = 'Términos y condiciones aceptados';
         btnAceptar.classList.add('btn-accepted');
@@ -510,17 +522,16 @@ router.get('/tyc/:token', async (req, res) => {
           btnAceptar.disabled = true;
           return;
         }
-
         const scrollTop = tycBox.scrollTop;
         const scrollHeight = tycBox.scrollHeight;
         const clientHeight = tycBox.clientHeight;
 
         if (scrollTop + clientHeight >= scrollHeight - 5) {
           btnAceptar.disabled = false;
-          msg.textContent = "Ya puedes aceptar los términos y condiciones.";
+          msg.textContent = 'Ya puedes aceptar los términos y condiciones.';
         } else {
           btnAceptar.disabled = true;
-          msg.textContent = "Desplázate hasta el final para habilitar el botón.";
+          msg.textContent = 'Desplázate hasta el final para habilitar el botón.';
         }
       }
 
@@ -528,7 +539,6 @@ router.get('/tyc/:token', async (req, res) => {
       if (ALREADY_ACCEPTED) {
         marcarComoAceptadoUI();
       } else {
-        msg.textContent = "Desplázate hasta el final para habilitar el botón.";
         tycBox.addEventListener('scroll', checkScroll);
         checkScroll();
       }
@@ -537,22 +547,19 @@ router.get('/tyc/:token', async (req, res) => {
         if (tycAceptados) return;
 
         btnAceptar.disabled = true;
-        msg.textContent = "Registrando tu aceptación, por favor espera...";
+        msg.textContent = 'Registrando tu aceptación, por favor espera...';
 
         try {
-          const response = await fetch("/api/tyc/" + encodeURIComponent(TOKEN) + "/aceptar", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
+          const response = await fetch('/api/tyc/' + encodeURIComponent(TOKEN) + '/aceptar', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({})
           });
 
           const data = await response.json();
 
           if (!data.ok) {
-            msg.textContent = "No fue posible registrar tu aceptación: " + (data.error || "intenta más tarde.");
-            // Permitimos reintentar, pero solo se habilitará si está al final.
+            msg.textContent = 'No fue posible registrar tu aceptación: ' + (data.error || 'intenta más tarde.');
             tycAceptados = false;
             checkScroll();
             return;
@@ -561,7 +568,7 @@ router.get('/tyc/:token', async (req, res) => {
           marcarComoAceptadoUI();
         } catch (error) {
           console.error(error);
-          msg.textContent = "Ocurrió un error al registrar tu aceptación. Intenta nuevamente.";
+          msg.textContent = 'Ocurrió un error al registrar tu aceptación. Intenta nuevamente.';
           tycAceptados = false;
           checkScroll();
         }
@@ -586,33 +593,12 @@ router.get('/tyc/:token', async (req, res) => {
       // Imprimir
       btnImprimir?.addEventListener('click', () => {
         window.print();
-      });ST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({})
-          });
-
-          const data = await response.json();
-
-          if (!data.ok) {
-            msg.textContent = "No fue posible registrar tu aceptación: " + (data.error || "intenta más tarde.");
-            btnAceptar.disabled = false;
-            return;
-          }
-
-          msg.textContent = "¡Listo! Tu aceptación ha quedado registrada. Puedes regresar a la conversación.";
-        } catch (error) {
-          console.error(error);
-          msg.textContent = "Ocurrió un error al registrar tu aceptación. Intenta nuevamente.";
-          btnAceptar.disabled = false;
-        }
       });
     </script>
   </div>
 </body>
 </html>
-  `;
+`;
 
   return res.send(html);
 });
