@@ -784,38 +784,63 @@ router.post('/api/tyc/:token/aceptar', async (req, res) => {
  * - Envía webhook TYC_EXPIRADA para cada una.
  */
 router.post('/api/tyc/cron/check-expired', requireInternalSecret, async (req, res) => {
-  const ahora = new Date();
-  let contador = 0;
+  try {
+    // n8n (Cron) llama este endpoint cada X minutos para marcar expiradas
+    // y obtener la lista de solicitudes recién-expiradas.
+    const limit = Number(req.body?.limit ?? req.query?.limit ?? 200);
+    const batchSize = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 1000) : 200;
 
-  const tokens = Array.from(solicitudesTyC.keys());
+    const result = await pool.query(
+      `WITH exp AS (
+         SELECT token
+         FROM tyc_solicitudes
+         WHERE expires_at < NOW()
+           AND estado <> $1
+           AND estado <> $2
+         ORDER BY expires_at ASC
+         LIMIT $3
+       )
+       UPDATE tyc_solicitudes t
+       SET estado = $2
+       FROM exp
+       WHERE t.token = exp.token
+       RETURNING
+         t.token,
+         t.precliente_id,
+         t.tyc_solicitud_id,
+         t.expires_at`,
+      [STATES.ACEPTADA, STATES.EXPIRADA, batchSize]
+    );
 
-  for (const token of tokens) {
-    const solicitud = solicitudesTyC.get(token);
-    if (!solicitud) continue;
+    const expiradas = (result.rows || []).map((r) => ({
+      token: r.token,
+      preclienteId: r.precliente_id,
+      tycSolicitudId: r.tyc_solicitud_id,
+      expiresAt: r.expires_at?.toISOString?.() ?? String(r.expires_at),
+      evento: 'TYC_EXPIRADA'
+    }));
 
-    const expira = new Date(solicitud.expiresAt);
-
-    if (
-      (solicitud.estado === STATES.CREADA || solicitud.estado === STATES.ABIERTA) &&
-      expira < ahora
-    ) {
-      solicitud.estado = STATES.EXPIRADA;
-      solicitudesTyC.set(token, solicitud);
-
-      try {
-        await sendWebhook(solicitud, 'TYC_EXPIRADA');
-      } catch (err) {
-        console.error('Error en webhook TYC_EXPIRADA (cron):', err.message);
+    // (Opcional) actualizar cache en memoria si existiera
+    for (const e of expiradas) {
+      const mem = solicitudesTyC.get(e.token);
+      if (mem && mem.estado !== STATES.ACEPTADA) {
+        mem.estado = STATES.EXPIRADA;
+        solicitudesTyC.set(e.token, mem);
       }
-
-      contador++;
     }
-  }
 
-  return res.json({
-    ok: true,
-    expiradas: contador
-  });
+    return res.json({
+      ok: true,
+      procesadas: expiradas.length,
+      expiradas
+    });
+  } catch (err) {
+    console.error('[TyC][CRON] Error marcando expiradas:', err);
+    return res.status(500).json({
+      ok: false,
+      error: 'Error procesando expiraciones'
+    });
+  }
 });
 
 module.exports = {
