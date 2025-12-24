@@ -791,49 +791,49 @@ router.post('/api/tyc/cron/check-expired', requireInternalSecret, async (req, re
     const batchSize = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 1000) : 200;
 
     const result = await pool.query(
-      `WITH exp AS (
-         SELECT token
-         FROM tyc_solicitudes
-         WHERE expires_at < NOW()
-           AND estado <> $1
-           AND estado <> $2
-         ORDER BY expires_at ASC
-         LIMIT $3
-       )
-       UPDATE tyc_solicitudes t
-       SET estado = $2
-       FROM exp
-       WHERE t.token = exp.token
-       RETURNING
-         t.token,
-         t.precliente_id,
-         t.tyc_solicitud_id,
-         t.expires_at`,
-      [STATES.ACEPTADA, STATES.EXPIRADA, batchSize]
-    );
+  `WITH exp AS (
+     SELECT token
+     FROM tyc_solicitudes
+     WHERE expires_at < NOW()
+       AND estado <> $1
+       AND estado <> $2
+     ORDER BY expires_at ASC
+     LIMIT $3
+   )
+   UPDATE tyc_solicitudes t
+   SET estado = $2
+   FROM exp
+   WHERE t.token = exp.token
+   RETURNING
+     t.token,
+     t.precliente_id,
+     t.tyc_solicitud_id,
+     t.expires_at,
+     COALESCE(
+       NULLIF(t.metadata->>'whatsappNumero',''),
+       NULLIF(t.metadata->>'whatsapp',''),
+       NULLIF(t.metadata->>'telefono',''),
+       NULLIF(t.metadata->>'phone','')
+     ) AS telefono,
+     t.metadata`,
+  [STATES.ACEPTADA, STATES.EXPIRADA, batchSize]
+  );
 
-    const expiradas = (result.rows || []).map((r) => ({
-      token: r.token,
-      preclienteId: r.precliente_id,
-      tycSolicitudId: r.tyc_solicitud_id,
-      expiresAt: r.expires_at?.toISOString?.() ?? String(r.expires_at),
-      evento: 'TYC_EXPIRADA'
-    }));
+  const expiradas = (result.rows || []).map((r) => {
+    const telefonoRaw = r.telefono || null;
+    const telefonoDigits = telefonoRaw ? String(telefonoRaw).replace(/\D/g, '') : null;
 
-    // (Opcional) actualizar cache en memoria si existiera
-    for (const e of expiradas) {
-      const mem = solicitudesTyC.get(e.token);
-      if (mem && mem.estado !== STATES.ACEPTADA) {
-        mem.estado = STATES.EXPIRADA;
-        solicitudesTyC.set(e.token, mem);
-      }
-    }
-
-    return res.json({
-      ok: true,
-      procesadas: expiradas.length,
-      expiradas
-    });
+    return {
+    token: r.token,
+    preclienteId: r.precliente_id,
+    tycSolicitudId: r.tyc_solicitud_id,
+    expiresAt: r.expires_at?.toISOString?.() ?? String(r.expires_at),
+    telefono: telefonoRaw,
+    telefonoDigits,
+    metadata: r.metadata || {},
+    evento: 'TYC_EXPIRADA',
+    };
+  });
   } catch (err) {
     console.error('[TyC][CRON] Error marcando expiradas:', err);
     return res.status(500).json({
